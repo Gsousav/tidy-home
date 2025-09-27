@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <libgen.h>
 #include <glob.h>
+#include <ctype.h>
 
 #define MAX_PATH 1024
 #define MAX_FILES 1000
@@ -45,16 +46,17 @@ static int no_color = 0;
 // Function prototypes
 void show_help(void);
 void show_version(void);
-int create_directory(const char *path);
+char *get_home_path(const char *relative_path);
 int file_exists(const char *path);
 int is_directory(const char *path);
+int create_directory(const char *path);
 int ask_confirmation(const char *message);
 int move_file(const char *src, const char *dest);
-int move_files_by_pattern(const char *pattern, const char *dest_dir, const char *description);
-int move_specific_files(const char **files, int count, const char *dest_dir, const char *description);
+int should_preserve_file(const char *filepath);
 int is_project_directory(const char *path);
+int move_files_by_pattern(const char *pattern, const char *dest_dir, const char *description);
 void scan_and_suggest_projects(void);
-char *get_home_path(const char *relative_path);
+void scan_and_move_stray_dirs(void);
 void cleanup_home(void);
 
 void show_help(void) {
@@ -168,6 +170,71 @@ int move_file(const char *src, const char *dest) {
     }
 }
 
+int should_preserve_file(const char *filepath) {
+    const char *basename_file = basename((char*)filepath);
+    
+    // Always preserve critical dotfiles and configs
+    const char *critical_files[] = {
+        ".bashrc", ".zshrc", ".profile", ".bash_profile", ".vimrc", ".gitconfig",
+        ".bash_history", ".python_history", ".lesshst", ".viminfo"
+    };
+    
+    for (size_t i = 0; i < sizeof(critical_files) / sizeof(critical_files[0]); i++) {
+        if (strcmp(basename_file, critical_files[i]) == 0) {
+            return 1;
+        }
+    }
+    
+    // Preserve standard directories
+    const char *standard_dirs[] = {
+        "Desktop", "Documents", "Downloads", "Pictures", "Videos", "Music",
+        "Public", "Templates", "bin", "Projects", "Misc", "tmp", "dev"
+    };
+    
+    for (size_t i = 0; i < sizeof(standard_dirs) / sizeof(standard_dirs[0]); i++) {
+        if (strcmp(basename_file, standard_dirs[i]) == 0) {
+            return 1;
+        }
+    }
+    
+    // Preserve important hidden directories
+    const char *important_hidden[] = {
+        ".config", ".local", ".cache", ".ssh", ".gnupg", ".git"
+    };
+    
+    for (size_t i = 0; i < sizeof(important_hidden) / sizeof(important_hidden[0]); i++) {
+        if (strcmp(basename_file, important_hidden[i]) == 0) {
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+
+int is_project_directory(const char *path) {
+    if (!is_directory(path)) return 0;
+    
+    char check_path[MAX_PATH];
+    const char *project_indicators[] = {
+        "package.json", "Cargo.toml", "setup.py", "requirements.txt",
+        "Makefile", "CMakeLists.txt", ".git", "pom.xml", "build.gradle"
+    };
+    
+    for (size_t i = 0; i < sizeof(project_indicators) / sizeof(project_indicators[0]); i++) {
+        snprintf(check_path, sizeof(check_path), "%s/%s", path, project_indicators[i]);
+        if (file_exists(check_path)) return 1;
+    }
+    
+    // Check directory name patterns
+    const char *name = basename((char*)path);
+    if (strstr(name, "project") || strstr(name, "code") || 
+        strncmp(name, "ml-", 3) == 0 || strcmp(name, "raylib") == 0) {
+        return 1;
+    }
+    
+    return 0;
+}
+
 int move_files_by_pattern(const char *pattern, const char *dest_dir, const char *description) {
     char *home_pattern = get_home_path(pattern);
     if (!home_pattern) return 0;
@@ -207,9 +274,17 @@ int move_files_by_pattern(const char *pattern, const char *dest_dir, const char 
         }
     }
     
-    // Move each file
+    // Move each file, but skip preserved ones
     int success = 1;
     for (size_t i = 0; i < glob_result.gl_pathc; i++) {
+        // Skip preserved files
+        if (should_preserve_file(glob_result.gl_pathv[i])) {
+            if (verbose) {
+                log_info("Skipping preserved file: %s", basename(glob_result.gl_pathv[i]));
+            }
+            continue;
+        }
+        
         char dest_path[MAX_PATH];
         snprintf(dest_path, sizeof(dest_path), "%s/%s", dest_dir, basename(glob_result.gl_pathv[i]));
         
@@ -225,97 +300,6 @@ int move_files_by_pattern(const char *pattern, const char *dest_dir, const char 
     globfree(&glob_result);
     free(home_pattern);
     return success;
-}
-
-int move_specific_files(const char **files, int count, const char *dest_dir, const char *description) {
-    char **found_files = malloc(count * sizeof(char*));
-    int found_count = 0;
-    
-    if (!found_files) {
-        log_error("Memory allocation failed");
-        return 0;
-    }
-    
-    // Check which files exist
-    for (int i = 0; i < count; i++) {
-        char *full_path = get_home_path(files[i]);
-        if (full_path && file_exists(full_path)) {
-            found_files[found_count] = full_path;
-            found_count++;
-        } else if (full_path) {
-            free(full_path);
-        }
-    }
-    
-    if (found_count == 0) {
-        if (verbose) log_info("No specific files found for %s", description);
-        free(found_files);
-        return 1;
-    }
-    
-    log_info("Moving %s (%d files found)", description, found_count);
-    
-    // Show files if interactive
-    if (interactive) {
-        printf("Files to move:\n");
-        for (int i = 0; i < found_count; i++) {
-            printf("  - %s\n", basename(found_files[i]));
-        }
-        
-        char question[256];
-        snprintf(question, sizeof(question), "Move these files to %s?", dest_dir);
-        if (!ask_confirmation(question)) {
-            log_info("Skipping %s", description);
-            for (int i = 0; i < found_count; i++) {
-                free(found_files[i]);
-            }
-            free(found_files);
-            return 1;
-        }
-    }
-    
-    // Move files
-    int success = 1;
-    for (int i = 0; i < found_count; i++) {
-        char dest_path[MAX_PATH];
-        snprintf(dest_path, sizeof(dest_path), "%s/%s", dest_dir, basename(found_files[i]));
-        
-        if (verbose || dry_run) {
-            printf("  %s -> %s/\n", basename(found_files[i]), dest_dir);
-        }
-        
-        if (!move_file(found_files[i], dest_path)) {
-            success = 0;
-        }
-        free(found_files[i]);
-    }
-    
-    free(found_files);
-    return success;
-}
-
-int is_project_directory(const char *path) {
-    if (!is_directory(path)) return 0;
-    
-    char check_path[MAX_PATH];
-    const char *project_indicators[] = {
-        "package.json", "Cargo.toml", "setup.py", "requirements.txt",
-        "Makefile", "CMakeLists.txt", ".git", "pom.xml", "build.gradle"
-    };
-    
-    for (size_t i = 0; i < sizeof(project_indicators) / sizeof(project_indicators[0]); i++) {
-        snprintf(check_path, sizeof(check_path), "%s/%s", path, project_indicators[i]);
-        if (file_exists(check_path)) return 1;
-    }
-    
-    // Check directory name patterns
-    const char *name = basename((char*)path);
-    if (strstr(name, "project") || strstr(name, "code") || 
-        strncmp(name, "ml-", 3) == 0 || strcmp(name, "raylib") == 0) {
-        return 1;
-    }
-    
-    return 0;
 }
 
 void scan_and_suggest_projects(void) {
@@ -361,6 +345,89 @@ void scan_and_suggest_projects(void) {
     free(home);
 }
 
+void scan_and_move_stray_dirs(void) {
+    char *home = get_home_path("");
+    if (!home) return;
+    
+    char *misc_dir = get_home_path("Misc");
+    if (!misc_dir) {
+        free(home);
+        return;
+    }
+    
+    DIR *dir = opendir(home);
+    if (!dir) {
+        log_error("Cannot open home directory");
+        free(home);
+        free(misc_dir);
+        return;
+    }
+    
+    log_info("Scanning for stray directories to organize...");
+    
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue; // Skip hidden dirs
+        
+        char full_path[MAX_PATH];
+        snprintf(full_path, sizeof(full_path), "%s/%s", home, entry->d_name);
+        
+        // Only process directories
+        if (!is_directory(full_path)) continue;
+        
+        // Skip if it's a preserved directory
+        if (should_preserve_file(full_path)) continue;
+        
+        // Skip if it's a detected project
+        if (is_project_directory(full_path)) continue;
+        
+        // Check for directories that look like they should be moved
+        const char *name = entry->d_name;
+        int should_move = 0;
+        
+        // Single character directories or weird names
+        if (strlen(name) == 1 && (name[0] == '-' || isdigit(name[0]))) {
+            should_move = 1;
+        }
+        // Directories with obvious temporary/download patterns
+        else if (strstr(name, "tmp") || strstr(name, "temp") || 
+                 strstr(name, "download") || strstr(name, "extract") ||
+                 strstr(name, "backup") || strstr(name, "old")) {
+            should_move = 1;
+        }
+        // Application directories that aren't in standard locations
+        else if (strstr(name, "linux-x64") || strstr(name, "AppImage") ||
+                 strstr(name, "portable") || strstr(name, "standalone") ||
+                 strcmp(name, "ado") == 0) { // Add specific cases like 'ado'
+            should_move = 1;
+        }
+        
+        if (should_move) {
+            if (interactive) {
+                char question[512];
+                snprintf(question, sizeof(question), 
+                    "Move directory '%s' to ~/Misc?", name);
+                if (!ask_confirmation(question)) continue;
+            }
+            
+            char dest_path[MAX_PATH];
+            snprintf(dest_path, sizeof(dest_path), "%s/%s", misc_dir, name);
+            
+            if (verbose || dry_run) {
+                printf("  %s/ -> Misc/\n", name);
+            }
+            
+            if (!move_file(full_path, dest_path)) {
+                log_warning("Failed to move directory %s", name);
+            }
+        }
+    }
+    
+    closedir(dir);
+    free(home);
+    free(misc_dir);
+}
+
 void cleanup_home(void) {
     // Create necessary directories
     char *misc_dir = get_home_path("Misc");
@@ -377,25 +444,51 @@ void cleanup_home(void) {
         goto cleanup;
     }
     
-    // Move stray files to Misc
-    log_info("=== Moving stray files to ~/Misc ===");
-    move_files_by_pattern("1*", misc_dir, "Numbered files");
-    move_files_by_pattern("cbmgm.md*", misc_dir, "cbmgm markdown files");
-    move_files_by_pattern("sys_info_page.html*", misc_dir, "System info pages");
-    move_files_by_pattern("text.swift*", misc_dir, "Swift text files");
-    move_files_by_pattern("*.pdf", misc_dir, "PDF files");
-    
-    // Move backup/temp files to tmp
+    // Move backup/temp files to tmp (do this first as it's safest)
     log_info("=== Moving backup/temp files to ~/tmp ===");
-    move_files_by_pattern(".bash_history-*.tmp", tmp_dir, "Bash history backups");
-    move_files_by_pattern("*~", tmp_dir, "Backup files (ending with ~)");
     move_files_by_pattern("*.un~", tmp_dir, "Vim undo files");
-    move_files_by_pattern("*un~*", tmp_dir, "Vim backup files");
-    move_files_by_pattern("*.dta*", tmp_dir, "Data files");
+    move_files_by_pattern("*~", tmp_dir, "Backup files (ending with ~)");
     move_files_by_pattern("*.tmp", tmp_dir, "Temporary files");
     move_files_by_pattern("*.bak", tmp_dir, "Backup files");
+    move_files_by_pattern(".bash_history-*", tmp_dir, "Bash history backups");
+    move_files_by_pattern("*.log", tmp_dir, "Log files");
+    move_files_by_pattern("*.old", tmp_dir, "Old files");
     
-    // Scan for project directories
+    // Move obvious stray files to Misc
+    log_info("=== Moving stray files to ~/Misc ===");
+    move_files_by_pattern("[0-9]*", misc_dir, "Files starting with numbers");
+    move_files_by_pattern("*.html", misc_dir, "HTML files");
+    move_files_by_pattern("*.pdf", misc_dir, "PDF files");
+    move_files_by_pattern("*.md", misc_dir, "Markdown files");
+    move_files_by_pattern("*.txt", misc_dir, "Text files");
+    move_files_by_pattern("*.doc", misc_dir, "Word documents");
+    move_files_by_pattern("*.docx", misc_dir, "Word documents");
+    move_files_by_pattern("*.csv", misc_dir, "CSV files");
+    move_files_by_pattern("*.json", misc_dir, "JSON files");
+    move_files_by_pattern("*.xml", misc_dir, "XML files");
+    move_files_by_pattern("*.sql", misc_dir, "SQL files");
+    move_files_by_pattern("*.db", misc_dir, "Database files");
+    move_files_by_pattern("*.sqlite*", misc_dir, "SQLite database files");
+    move_files_by_pattern("*.dta", tmp_dir, "Stata data files");
+    
+    // Handle programming files that aren't in projects (be careful with these)
+    move_files_by_pattern("*.py", misc_dir, "Standalone Python files");
+    move_files_by_pattern("*.js", misc_dir, "Standalone JavaScript files");
+    move_files_by_pattern("*.swift", misc_dir, "Standalone Swift files");
+    
+    // Move archive files to tmp
+    move_files_by_pattern("*.zip", tmp_dir, "ZIP archives");
+    move_files_by_pattern("*.tar.gz", tmp_dir, "Compressed archives");
+    move_files_by_pattern("*.tar", tmp_dir, "Archive files");
+    move_files_by_pattern("*.gz", tmp_dir, "Compressed files");
+    move_files_by_pattern("*.rar", tmp_dir, "RAR archives");
+    move_files_by_pattern("*.7z", tmp_dir, "7-Zip archives");
+    
+    // Scan and move stray directories
+    log_info("=== Organizing stray directories ===");
+    scan_and_move_stray_dirs();
+    
+    // Scan for project directories (suggestion only)
     log_info("=== Scanning for project directories ===");
     scan_and_suggest_projects();
     
@@ -403,6 +496,7 @@ void cleanup_home(void) {
         log_success("Dry run completed - no files were actually moved");
     } else {
         log_success("Home directory cleanup completed");
+        log_info("Check ~/Misc, ~/tmp, and consider organizing ~/Projects");
     }
 
 cleanup:
