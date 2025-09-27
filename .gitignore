@@ -1,4 +1,8 @@
-# Compiled binaries
+# Build artifacts (now organized in build/ directory)
+build/
+dist/
+
+# Compiled binaries (legacy - keeping for compatibility)
 tidy-home
 *.o
 *.out
@@ -34,11 +38,6 @@ tidy-home
 ehthumbs.db
 Thumbs.db
 
-# Build directories
-build/
-dist/
-target/
-
 # Logs
 *.log
 
@@ -47,3 +46,11 @@ target/
 *.zip
 *.deb
 *.rpm
+
+# Test artifacts
+tests/test_*
+!tests/test_*.c
+
+# Core dumps
+core
+core.*
