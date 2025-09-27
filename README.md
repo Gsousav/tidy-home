@@ -21,7 +21,7 @@ TidyHome helps you clean up your home directory by automatically categorizing an
 
 ```bash
 # Clone the repository
-git clone 
+git clone git@github.com:Gsousav/tidy-home.git
 cd TidyHome
 
 # Build and install
